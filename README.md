@@ -142,7 +142,31 @@ Tests require no key or network access. They cover constant and falling prices, 
 
 The local server binds only to `127.0.0.1`, exposes allowlisted routes, and does not serve the project directory. Requests for `.env`, source files, and `.git` paths return 404. Simulation inputs are not sent to CMC or persisted.
 
-This is a local demo service, not a public production deployment. Public hosting still requires a reverse proxy, TLS, access and resource limits, and verified key management.
+The application also supports public deployment on Vercel. Setup and operational limits are described below.
+
+## Deploy to Vercel
+
+Import this repository with the **repository root** as Root Directory and **FastAPI** as Framework Preset. Keep Output Directory unset. The committed `vercel.json` builds the React frontend into `public/`, which Vercel serves from its CDN, and uses `server.py:app` for the API. Use a current Vercel CLI if building locally; `vercel build` requires the project to be linked and its settings downloaded first (`vercel link`, then `vercel pull`). Node.js 22.12+ is required. No separate frontend project or CORS configuration is needed.
+
+Set these variables in Vercel Settings → Environment Variables for both Preview and Production, then redeploy:
+
+| Variable | Value |
+| --- | --- |
+| `CMC_API_KEY` | Your CMC key; server-side only. `CMC_API` is also supported. |
+| `SNAPSHOT_SECRET` | A stable random secret shared by all instances, at least 32 characters. Generate one with `python -c "import secrets; print(secrets.token_hex(32))"`. |
+| `ALLOWED_HOSTS` | Optional comma-separated custom domains, e.g. `runway.example.com,www.runway.example.com`. Use hostnames without a scheme, path, port, or wildcard. |
+
+Vercel's exact deployment, branch, and production hostnames are accepted using `VERCEL_URL`, `VERCEL_BRANCH_URL`, and `VERCEL_PROJECT_PRODUCTION_URL`. Keep Vercel system environment variables enabled. Other hosts are rejected. Public browser POST requests must have the same HTTPS origin; local Vite origins remain supported only on localhost. These checks prevent unwanted browser origins but are not user authentication: the deployed calculator is publicly accessible.
+
+Snapshots are signed with HMAC-SHA256 and expire after 24 hours. A calculation can therefore reach a different instance without losing the quote or trusting browser-supplied prices. Rotating `SNAPSHOT_SECRET` invalidates existing snapshots; refresh market data afterward. Without this variable, Vercel quote requests return a configuration error. Local development uses a temporary process secret; set the variable for any multi-worker host.
+
+Vercel quote caches use temporary storage and may disappear on a cold start. The 60-second CMC refresh interval is **per instance**, not global. Configure Vercel Firewall rate limits for `/api/market`, `/api/stress`, and `/api/simulate`, and monitor CMC credits; sustained traffic may require a shared cache. API responses remain uncached by browsers. The CMC key and local `.env` files are never shipped to the browser; `.vercelignore` excludes local secrets, caches, dependencies, and videos from deployment uploads.
+
+Historical scenarios require complete downloaded data. For deployment, copy only the validated `history-*.json` files from `.cache/` into `evidence/history/` before deploying, subject to your CMC data license. Do not download history during requests or builds. If no complete files are packaged, historical scenarios remain unavailable; recorded replay and hypothetical scenarios still work. Other ASGI hosts can set `HISTORY_DIR` and `CACHE_DIR` to suitable paths.
+
+After deployment, check `/`, `/api/market?mode=recorded`, live market refresh, and one simulation/stress run. Requests for `/.env` and `/server.py` must return 404. For a non-Vercel host, build `frontend/dist`, set the same variables, and run `uvicorn server:app --host 0.0.0.0 --port 8000` behind an HTTPS reverse proxy.
+
+Reference: [Vercel FastAPI deployment and static-file documentation](https://vercel.com/docs/frameworks/backend/fastapi).
 
 ## Submission
 

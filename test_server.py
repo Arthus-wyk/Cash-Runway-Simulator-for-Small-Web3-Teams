@@ -68,6 +68,59 @@ class ParsingTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_public_hosts_https_origin_and_cross_instance_snapshot(self):
+        with patch.dict('os.environ', {'ALLOWED_HOSTS': 'runway.example',
+                                     'SNAPSHOT_SECRET': 'test-secret-' * 4}):
+            first = Market(Path(self.temp.name))
+            second = Market(Path(self.temp.name))
+            with TestClient(server.create_app(first), base_url='https://runway.example') as client:
+                response = client.get('/api/market?mode=recorded')
+                self.assertEqual(response.status_code, 200)
+                snapshot = response.json()
+            with TestClient(server.create_app(second), base_url='https://runway.example') as client:
+                body = {'snapshot_id': snapshot['snapshot_id'], 'inputs': inputs()}
+                response = client.post('/api/simulate', json=body, headers={'Origin': 'https://runway.example'})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()['market']['prices'], snapshot['prices'])
+                for origin in ['https://evil.test', 'http://runway.example', 'http://localhost:5173']:
+                    self.assertEqual(client.post('/api/simulate', json=body,
+                                                 headers={'Origin': origin}).status_code, 403)
+                self.assertEqual(client.get('/api/scenarios', headers={'Host': 'evil.test'}).status_code, 403)
+                body['snapshot_id'] = 'X' + snapshot['snapshot_id'][1:]
+                self.assertEqual(client.post('/api/simulate', json=body).status_code, 409)
+                body['snapshot_id'] = snapshot['snapshot_id']
+                with patch('server.utcnow', return_value=datetime.now(timezone.utc) + timedelta(days=2)):
+                    self.assertEqual(client.post('/api/simulate', json=body).status_code, 409)
+
+    def test_vercel_entrypoint_temp_cache_and_automatic_hostname(self):
+        self.assertIsInstance(server.app, server.FastAPI)
+        with patch.dict('os.environ', {'VERCEL': '1', 'VERCEL_URL': 'runway-preview.vercel.app',
+                                     'SNAPSHOT_SECRET': 'test-secret-' * 4}), \
+                patch('server.tempfile.gettempdir', return_value=self.temp.name):
+            market = Market()
+            self.assertTrue(market.cache_dir.is_relative_to(Path(self.temp.name)))
+            with TestClient(server.create_app(market), base_url='https://runway-preview.vercel.app') as client:
+                self.assertEqual(client.get('/api/market?mode=recorded').status_code, 200)
+                self.assertEqual(client.get('/api/scenarios', headers={'Host': 'other.vercel.app'}).status_code, 403)
+
+    def test_missing_deployment_secret_does_not_spend_cmc_credits(self):
+        with patch.dict('os.environ', {'VERCEL': '1', 'SNAPSHOT_SECRET': ''}):
+            market = Market(Path(self.temp.name))
+            with patch.object(market, 'request', side_effect=AssertionError('Do not call CMC without a signing secret')):
+                with self.assertRaises(CMCError) as raised:
+                    market.latest()
+                self.assertEqual(raised.exception.http_status, 503)
+
+    def test_cache_write_failure_keeps_valid_quote(self):
+        payload = copy.deepcopy(LATEST)
+        for item in payload['data']:
+            item['quote'][0]['last_updated'] = datetime.now(timezone.utc).isoformat()
+        with patch.object(self.market, 'request', return_value=payload), \
+                patch('server.tempfile.NamedTemporaryFile', side_effect=OSError('Read-only filesystem')):
+            snapshot = self.market.latest()
+        self.assertEqual(snapshot['mode'], 'live')
+        self.assertFalse(snapshot['stale'])
+
     def test_stress_and_drilldown_use_same_snapshot(self):
         snapshot = self.client.get('/api/market?mode=recorded').json()
         body = {'snapshot_id': snapshot['snapshot_id'], 'inputs': inputs(),

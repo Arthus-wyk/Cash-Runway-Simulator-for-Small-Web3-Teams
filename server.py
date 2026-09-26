@@ -1,9 +1,12 @@
-"""Local FastAPI service for market data, simulations, and the React build."""
+"""FastAPI service for market data, simulations, and the React build."""
 import argparse
 import asyncio
-import hashlib
+import base64
+import hmac
 import json
 import os
+import secrets
+import tempfile
 import threading
 import time
 import urllib.error
@@ -22,6 +25,7 @@ from engine import COINS, compare, number
 from stress import PRESETS, build_path, run_stress
 
 ROOT = Path(__file__).resolve().parent
+LOCAL_SNAPSHOT_SECRET = secrets.token_hex(32)
 IDS = {'BTC': 1, 'ETH': 1027, 'USDC': 3408}
 SLUGS = {'BTC': 'bitcoin', 'ETH': 'ethereum', 'USDC': 'usd-coin'}
 BASE_URL = 'https://pro-api.coinmarketcap.com'
@@ -102,7 +106,7 @@ def load_key():
     # Support existing environment variable names without printing or sending the key to the browser.
     values = {}
     path = ROOT / '.env'
-    if path.exists():
+    if not os.environ.get('VERCEL') and path.exists():
         for line in path.read_text(encoding='utf-8-sig').splitlines():
             if '=' in line and not line.lstrip().startswith('#'):
                 name, value = line.split('=', 1)
@@ -114,12 +118,16 @@ def load_key():
 
 class Market:
     def __init__(self, cache_dir=None):
-        self.cache_dir = cache_dir or ROOT / '.cache'
-        self.cache_dir.mkdir(exist_ok=True)
+        default_cache = Path(tempfile.gettempdir()) / 'runway-cache' if os.environ.get('VERCEL') else ROOT / '.cache'
+        self.cache_dir = Path(cache_dir or os.environ.get('CACHE_DIR') or default_cache)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.history_dir = Path(os.environ.get('HISTORY_DIR') or
+                                (ROOT / 'evidence' / 'history' if os.environ.get('VERCEL') else self.cache_dir))
+        self.signing_secret = os.environ.get('SNAPSHOT_SECRET') or (
+            '' if os.environ.get('VERCEL') else LOCAL_SNAPSHOT_SECRET)
         self.cached = None
         self.next_refresh = 0
         self.last_error = None
-        self.snapshots = {}
         self.lock = threading.Lock()
         try:
             cached = json.loads((self.cache_dir / 'latest.json').read_text(encoding='utf-8'))
@@ -150,14 +158,15 @@ class Market:
         return payload
 
     def remember(self, snapshot):
-        encoded = json.dumps(snapshot, sort_keys=True).encode()
-        snapshot = {**snapshot, 'snapshot_id': hashlib.sha256(encoded).hexdigest()[:24]}
-        self.snapshots[snapshot['snapshot_id']] = snapshot
-        while len(self.snapshots) > 32:
-            del self.snapshots[next(iter(self.snapshots))]
-        return snapshot
+        # Signed quote data works across workers without accepting client-edited prices.
+        payload = {'snapshot': snapshot, 'issued_at': utcnow().isoformat()}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode()
+        signature = hmac.digest(self.signing_secret.encode(), ('runway-v1:' + encoded).encode(), 'sha256').hex()
+        return {**snapshot, 'snapshot_id': encoded + '.' + signature}
 
     def latest(self, mode='live'):
+        if len(self.signing_secret) < 32:
+            raise CMCError('Configure SNAPSHOT_SECRET with at least 32 random characters on the server', 503)
         with self.lock:
             if mode == 'recorded':
                 try:
@@ -181,9 +190,22 @@ class Market:
                     self.cached = {**parsed, 'fetched_at': utcnow().isoformat()}
                     self.last_error = None
                     cache = {'captured_at': self.cached['fetched_at'], 'response': payload}
-                    temp = self.cache_dir / 'latest.tmp'
-                    temp.write_text(json.dumps(cache), encoding='utf-8')
-                    temp.replace(self.cache_dir / 'latest.json')
+                    # ponytail: per-instance cache; use shared storage if CMC traffic needs a global cap.
+                    temp = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.cache_dir,
+                                                         suffix='.tmp', delete=False) as file:
+                            temp = Path(file.name)
+                            json.dump(cache, file)
+                        temp.replace(self.cache_dir / 'latest.json')
+                    except OSError:
+                        pass  # A disk-cache failure must not discard a validated live quote.
+                    finally:
+                        if temp is not None:
+                            try:
+                                temp.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                 except CMCError as error:
                     self.last_error = str(error)
             if self.cached is None or (utcnow() - timestamp(self.cached['as_of'])).total_seconds() > 86400:
@@ -209,7 +231,7 @@ class Market:
         if window is None:
             raise CMCError('Unknown historical scenario', 400)
         try:
-            data = json.loads((self.cache_dir / f'{scenario}.json').read_text(encoding='utf-8'))
+            data = json.loads((self.history_dir / f'{scenario}.json').read_text(encoding='utf-8'))
             path = parse_history(data['response'], window['start'], window['end'])
             return path, {**window, 'fetched_at': data['captured_at'], 'source': '/v2/cryptocurrency/ohlcv/historical'}
         except (OSError, ValueError, KeyError):
@@ -220,16 +242,23 @@ class Market:
         if not isinstance(body, dict):
             raise ValueError('Request body must be a JSON object')
         snapshot_id = body.get('snapshot_id')
-        if not isinstance(snapshot_id, str):
+        if not isinstance(snapshot_id, str) or len(snapshot_id) > 8192:
             raise CMCError('The quote snapshot has expired; refresh market data', 409)
-        with self.lock:
-            snapshot = self.snapshots.get(snapshot_id)
-        if snapshot is None:
-            raise CMCError('The quote snapshot has expired; refresh market data', 409)
+        try:
+            encoded, signature = snapshot_id.rsplit('.', 1)
+            expected = hmac.digest(self.signing_secret.encode(), ('runway-v1:' + encoded).encode(), 'sha256').hex()
+            if len(self.signing_secret) < 32 or not hmac.compare_digest(signature, expected):
+                raise ValueError()
+            payload = json.loads(base64.b64decode(encoded, altchars=b'-_', validate=True))
+            if not -300 <= (utcnow() - timestamp(payload['issued_at'])).total_seconds() <= 86400:
+                raise ValueError()
+            snapshot = payload['snapshot']
+        except (ValueError, TypeError, KeyError):
+            raise CMCError('The quote snapshot is invalid or expired; refresh market data', 409) from None
         age = (utcnow() - timestamp(snapshot['as_of'])).total_seconds()
         if snapshot['mode'] == 'live' and age > 86400:
             raise CMCError('The quote is more than 24 hours old; refresh market data', 409)
-        snapshot = {**snapshot}
+        snapshot = {**snapshot, 'snapshot_id': snapshot_id}
         if snapshot['mode'] == 'live' and age > 300:
             snapshot.update(stale=True, warning='The pinned quote snapshot is more than 5 minutes old; refresh to retrieve a new quote.')
         return snapshot
@@ -261,24 +290,30 @@ class Market:
 def create_app(market=None, frontend_dir=None):
     """Reuse the market service and expose only static files from the frontend build."""
     market = market or Market()
-    frontend_dir = Path(frontend_dir) if frontend_dir is not None else ROOT / 'frontend' / 'dist'
+    frontend_dir = Path(frontend_dir) if frontend_dir is not None else (
+        ROOT / 'public' if os.environ.get('VERCEL') else ROOT / 'frontend' / 'dist')
     app = FastAPI(title='Runway API', docs_url=None, redoc_url=None, openapi_url=None)
+    local_hosts = {'127.0.0.1', 'localhost'}
+    allowed_hosts = local_hosts | {host.strip().lower() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()}
+    allowed_hosts.update(os.environ[name].lower() for name in
+                         ('VERCEL_URL', 'VERCEL_PROJECT_PRODUCTION_URL', 'VERCEL_BRANCH_URL') if os.environ.get(name))
 
     @app.middleware('http')
     async def protect_request(request: Request, call_next):
         host = request.headers.get('host', '')
         try:
             parsed = urllib.parse.urlsplit('http://' + host)
-            trusted = parsed.hostname in ('127.0.0.1', 'localhost') and parsed.netloc == host
+            trusted = parsed.hostname in allowed_hosts and parsed.netloc == host
             trusted = trusted and parsed.username is None and parsed.password is None
             if parsed.port is not None:
                 trusted = trusted and 0 < parsed.port <= 65535
         except ValueError:
             trusted = False
-        # Vite uses port 5173; allow only the current origin and these two local development origins.
-        origins = {'http://' + host, 'http://127.0.0.1:5173', 'http://localhost:5173'}
+        origins = {'https://' + host}
+        if trusted and parsed.hostname in local_hosts:
+            origins.update({'http://' + host, 'http://127.0.0.1:5173', 'http://localhost:5173'})
         if not trusted:
-            response = JSONResponse({'error': 'Local access only'}, status_code=403)
+            response = JSONResponse({'error': 'Host is not allowed'}, status_code=403)
         elif request.method not in ('GET', 'HEAD') and request.headers.get('origin') not in (None, *origins):
             response = JSONResponse({'error': 'Cross-origin request rejected'}, status_code=403)
         else:
@@ -360,6 +395,9 @@ def create_app(market=None, frontend_dir=None):
     return app
 
 
+app = create_app()
+
+
 def fetch_history(market):
     for window in WINDOWS:
         start = (date.fromisoformat(window['start']) - timedelta(days=1)).isoformat()
@@ -368,7 +406,8 @@ def fetch_history(market):
                                   'time_period': 'daily', 'interval': 'daily', 'convert': 'USD', 'skip_invalid': 'false'})
         path = parse_history(payload, window['start'], window['end'])
         record = {'captured_at': utcnow().isoformat(), 'response': payload}
-        destination = market.cache_dir / f"{window['id']}.json"
+        market.history_dir.mkdir(parents=True, exist_ok=True)
+        destination = market.history_dir / f"{window['id']}.json"
         temp = destination.with_suffix('.tmp')
         temp.write_text(json.dumps(record), encoding='utf-8')
         temp.replace(destination)
@@ -407,12 +446,12 @@ if __name__ == '__main__':
     parser.add_argument('--fetch-history', action='store_true', help='Download and validate three historical scenarios with an eligible plan (about 36 credits)')
     parser.add_argument('--probe', action='store_true', help='Validate endpoints and update redacted evidence (about 1-2 credits)')
     args = parser.parse_args()
-    market = Market()
     if args.fetch_history or args.probe:
+        market = Market()
         try:
             fetch_history(market) if args.fetch_history else probe(market)
         except CMCError as error:
             print(str(error))
             raise SystemExit(1)
     else:
-        uvicorn.run(create_app(market), host='127.0.0.1', port=args.port, access_log=False)
+        uvicorn.run(app, host='127.0.0.1', port=args.port, access_log=False)
