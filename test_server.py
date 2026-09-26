@@ -68,6 +68,22 @@ class ParsingTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_live_and_custom_price_modes(self):
+        snapshot = self.market.remember({**parse_latest(LATEST), 'mode': 'live', 'as_of': server.utcnow().isoformat()})
+        targets = {'BTC': '40000', 'ETH': '1000', 'USDC': '0'}
+        body = {'snapshot_id': snapshot['snapshot_id'], 'scenario': 'custom-prices',
+                'inputs': inputs(start='2028-01-31', target_prices=targets)}
+        response = self.client.post('/api/simulate', json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['result']['path'][1]['prices'], targets)
+        body['scenario'] = 'live'
+        response = self.client.post('/api/simulate', json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['result']['path'][-1]['prices'], snapshot['prices'])
+        body['scenario'] = 'custom-prices'
+        del body['inputs']['target_prices']
+        self.assertEqual(self.client.post('/api/simulate', json=body).status_code, 400)
+
     def test_public_hosts_https_origin_and_cross_instance_snapshot(self):
         with patch.dict('os.environ', {'ALLOWED_HOSTS': 'runway.example',
                                      'SNAPSHOT_SECRET': 'test-secret-' * 4}):

@@ -273,16 +273,24 @@ class Market:
         snapshot = self.get_snapshot(body)
         scenario = body.get('scenario', 'custom')
         definition = body.get('scenario_definition')
+        target_prices = None
         if definition is not None:
             if not isinstance(body.get('inputs'), dict):
                 raise ValueError('Input must be an object')
             path = build_path(body['inputs'].get('start'), definition)
             source = {**definition, 'kind': 'hypothetical'}
+        elif scenario in ('live', 'custom-prices'):
+            if not isinstance(body.get('inputs'), dict):
+                raise ValueError('Input must be an object')
+            target_prices = snapshot['prices'] if scenario == 'live' else body['inputs'].get('target_prices')
+            if not isinstance(target_prices, dict):
+                raise ValueError('Custom prices must contain BTC, ETH, and USDC')
+            path, source = None, {'id': scenario, 'label': 'Current quotes held constant' if scenario == 'live' else 'Custom USD prices from next month'}
         elif scenario == 'custom':
             path, source = None, {'id': 'custom', 'label': 'User-defined one-time shock'}
         else:
             path, source = self.history(scenario)
-        result = compare(body.get('inputs'), snapshot['prices'], path, hypothetical=definition is not None)
+        result = compare(body.get('inputs'), snapshot['prices'], path, hypothetical=definition is not None, target_prices=target_prices)
         return {'version': 1, 'generated_at': utcnow().isoformat(), 'market': snapshot,
                 'scenario': source, 'inputs': body['inputs'], 'result': result}
 

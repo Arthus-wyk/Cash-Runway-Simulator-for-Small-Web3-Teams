@@ -109,9 +109,7 @@ function Comparison({ report, ledgerIndex, onLedgerChange }) {
 export default function App() {
   const [inputs, setInputs] = useState(createInputs);
   const [example, setExample] = useState(true);
-  const [scenario, setScenario] = useState('custom');
-  const [scenarios, setScenarios] = useState([]);
-  const [historyNotice, setHistoryNotice] = useState('Checking historical scenario availability…');
+  const [scenario, setScenario] = useState('live');
   const [snapshot, setSnapshot] = useState(null);
   const [completed, setCompleted] = useState(null);
   const [ledgerIndex, setLedgerIndex] = useState(0);
@@ -126,20 +124,21 @@ export default function App() {
   const ready = Boolean(report && completed.key === requestKey && !marketBusy && !error);
   const market = ready ? report.market : snapshot;
 
-  async function loadMarket(mode) {
+  async function loadMarket() {
     const current = ++marketRequest.current;
     generation.current++;
     setSnapshot(null);
     setMarketBusy(true);
     setError('');
-    setStatus(mode === 'recorded' ? 'Loading recorded real quotes…' : 'Retrieving CMC quotes…');
+    setStatus('Retrieving CMC quotes…');
     try {
-      const value = await requestApi('/api/market?mode=' + mode);
+      const value = await requestApi('/api/market?mode=live');
       if (current !== marketRequest.current) return;
       setSnapshot(value);
+      setInputs(previous => previous.target_prices ? previous : { ...previous, target_prices: { ...value.prices } });
     } catch (failure) {
       if (current !== marketRequest.current) return;
-      setError(failure.message + '. Select “Use recorded real quotes” to try the simulation.');
+      setError(failure.message);
       setStatus('Market data not loaded; calculation paused');
     } finally {
       if (current === marketRequest.current) setMarketBusy(false);
@@ -147,18 +146,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    loadMarket('live');
-    const controller = new AbortController();
-    requestApi('/api/scenarios', { signal: controller.signal }).then(values => {
-      if (controller.signal.aborted) return;
-      setScenarios(values);
-      const unavailable = values.filter(value => !value.available);
-      setHistoryNotice(unavailable.length
-        ? `${unavailable.length}/${values.length} historical scenarios are unavailable because complete historical data has not been retrieved. Try a custom scenario or see the README for setup.` : '');
-    }).catch(failure => {
-      if (!controller.signal.aborted) setHistoryNotice('Failed to read historical scenario status: ' + failure.message);
-    });
-    return () => { controller.abort(); marketRequest.current++; generation.current++; };
+    loadMarket();
+    return () => { marketRequest.current++; generation.current++; };
   }, []);
 
   useEffect(() => {
@@ -201,7 +190,8 @@ export default function App() {
   function resetInputs() {
     generation.current++;
     setInputs(createInputs());
-    setScenario('custom');
+    setScenario('live');
+    if (snapshot) setInputs({ ...createInputs(), target_prices: { ...snapshot.prices } });
     setExample(true);
   }
 
@@ -230,13 +220,17 @@ export default function App() {
       </aside><main className="content">
         <section className="panel controls" aria-labelledby="scenario-title"><div className="scenario-row"><h2 id="scenario-title"><span className="section-num">03</span>If the market changes</h2>
           <select aria-label="Market scenario" value={scenario} onChange={event => { generation.current++; setScenario(event.target.value); setExample(false); }}>
-            <option value="custom">Custom — one-time change</option>{scenarios.map(value => <option key={value.id} value={value.id} disabled={!value.available}>{value.label}{value.available ? ' — real history' : ' — unavailable'}</option>)}
+            <option value="live">Current live prices</option>
+            <option value="custom-prices">Custom prices — USD</option>
           </select></div>
-          {scenario === 'custom' && <div className="shock-fields">{coins.map(coin => <NumberField key={coin} id={`shock-${coin.toLowerCase()}`} label={`${coin} change — %`} min="-100" max="1000" value={inputs.shocks[coin]} onChange={event => updateInput(event, 'shocks', coin)} />)}</div>}
-          <p className="footnote">{scenario === 'custom' ? 'Build the cash reserve first, apply one price change the next day, then hold prices flat. The simulation runs for 12 months.' : 'Apply real historical daily relative changes to the starting quote. This replays relative days and is not a future forecast.'}</p>
+          <div className="shock-fields">{coins.map(coin => scenario === 'custom-prices'
+            ? <NumberField key={coin} id={`price-${coin.toLowerCase()}`} label={`${coin} price — USD`} max="1000000000000" value={inputs.target_prices?.[coin] ?? ''} onChange={event => updateInput(event, 'target_prices', coin)} note={snapshot ? `Current quote: $${units(snapshot.prices[coin])}` : 'Load live quotes to initialize prices'} />
+            : <div key={coin} className="field"><span>{coin} price — USD</span><strong>{snapshot ? `$${units(snapshot.prices[coin])}` : 'Loading…'}</strong></div>)}</div>
+          <button type="button" disabled={marketBusy} onClick={() => loadMarket()}>{marketBusy ? 'Refreshing…' : 'Refresh live market data'}</button>
+          {snapshot && <p className="small">Quote time: {snapshot.as_of.replace('T', ' ').replace('+00:00', ' UTC')}. Quotes may be cached for 60 seconds.</p>}
+          <p className="footnote">{scenario === 'live' ? 'Use the latest loaded prices throughout the 12-month simulation; future prices are assumed constant.' : 'Build the cash reserve at current quotes. Custom prices apply from the first day of the next calendar month and then stay constant. Refreshing quotes preserves your custom prices.'}</p>
           <div className="reserve"><div><h3>Strategy B: hold <strong>{inputs.reserve_months}</strong> months of expenses in cash</h3><p className="small">Existing cash counts; any required conversion happens once at the start.</p></div><div><input aria-label="Cash reserve months" type="range" min="0" max="12" step="1" value={inputs.reserve_months} onChange={event => updateInput(event, null, 'reserve_months')} /><div className="ticks"><span>0 months</span><span>6 months</span><span>12 months</span></div></div></div>
         </section>
-        {historyNotice && <div className="notice">{historyNotice}</div>}
         {market?.warning && <div className="notice">{market.warning}</div>}
         {error && <div className="notice error" role="alert">{error}</div>}
         <div className="status-line" role="status" aria-live="polite">{status}</div>
@@ -247,7 +241,7 @@ export default function App() {
         <div className="source"><div>{market
           ? `${market.mode === 'recorded' ? 'Recorded replay' : 'Pinned market snapshot'} — CoinMarketCap — quote time ${market.as_of.replace('T', ' ').replace('+00:00', ' UTC')} — credits used: ${market.credit_count ?? 'unknown'}`
           : 'Data source: CoinMarketCap — read-only market data'}</div>
-          <div className="source-buttons"><button type="button" disabled={marketBusy} onClick={() => loadMarket('live')}>Refresh live market data</button><button type="button" disabled={marketBusy} onClick={() => loadMarket('recorded')}>Use recorded real quotes</button></div>
+
         </div>
       </main></div>
     </form>

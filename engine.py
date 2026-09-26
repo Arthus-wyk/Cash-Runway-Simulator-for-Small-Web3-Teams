@@ -146,7 +146,7 @@ def serializable(value):
     return value
 
 
-def compare(inputs, prices, history=None, *, hypothetical=False):
+def compare(inputs, prices, history=None, *, hypothetical=False, target_prices=None):
     with localcontext() as context:
         context.prec = 40
         if not isinstance(inputs, dict):
@@ -168,7 +168,11 @@ def compare(inputs, prices, history=None, *, hypothetical=False):
         end = month_after(start, 12)
         days = (end - start).days
         dates = payment_dates(start, day)
-        if history is None:
+        if target_prices is not None:
+            targets = coin_values(target_prices, 'Custom price')
+            change_day = month_after(start.replace(day=1), 1)
+            path = [prices if start + timedelta(days=i) < change_day else targets for i in range(days + 1)]
+        elif history is None:
             shocks = coin_values(inputs.get('shocks'), 'Price change', Decimal(-100), Decimal(1000))
             shocked = {c: prices[c] * (ONE + shocks[c] / 100) for c in COINS}
             path = [prices] + [shocked] * days
@@ -180,7 +184,8 @@ def compare(inputs, prices, history=None, *, hypothetical=False):
                 raise ValueError('The relative price on the historical baseline date must equal 1')
             path = [{c: prices[c] * ratios[i][c] for c in COINS} for i in range(days + 1)]
         assumptions = [rule for index, rule in enumerate(RULES) if index not in (4, 5)]
-        assumptions.append('Hypothetical path: node changes are relative to the starting quote and linearly interpolated over calendar days; this is neither historical data nor a forecast.'
+        assumptions.append('Starting prices apply until the first day of the next calendar month; selected USD prices then remain constant. These are simulation assumptions, not a forecast.'
+                           if target_prices is not None else 'Hypothetical path: node changes are relative to the starting quote and linearly interpolated over calendar days; this is neither historical data nor a forecast.'
                            if hypothetical else RULES[4 if history is None else 5])
         result = dict(start=start.isoformat(), end=end.isoformat(), payment_dates=[d.isoformat() for d in dates],
                       initial_total=total(cash, initial, prices),

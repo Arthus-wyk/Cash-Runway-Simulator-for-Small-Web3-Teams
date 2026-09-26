@@ -18,6 +18,20 @@ PRICES = {'BTC': '100', 'ETH': '10', 'USDC': '1'}
 
 
 class EngineTests(unittest.TestCase):
+    def test_custom_prices_switch_next_month_and_validate(self):
+        targets = {'BTC': '50', 'ETH': '0', 'USDC': '1'}
+        result = compare(inputs(start='2028-01-31'), PRICES, target_prices=targets)
+        self.assertEqual(result['path'][0]['prices'], PRICES)
+        self.assertEqual(result['path'][1]['date'], '2028-02-01')
+        self.assertEqual(result['path'][1]['prices'], targets)
+        self.assertEqual(result['path'][-1]['prices'], targets)
+        self.assertEqual(result['strategies'][1]['initial_sale']['sold']['BTC'], '3')
+        live = compare(inputs(), PRICES, target_prices=PRICES)
+        self.assertTrue(all(point['prices'] == PRICES for point in live['path']))
+        for invalid in ({}, {**targets, 'BTC': '-1'}, {**targets, 'BTC': 'NaN'}):
+            with self.assertRaises(ValueError):
+                compare(inputs(), PRICES, target_prices=invalid)
+
     def test_constant_price_and_exact_depletion(self):
         a, b = compare(inputs(), PRICES)['strategies']
         for s in (a, b):
