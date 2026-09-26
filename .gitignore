@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.cache/
+__pycache__/
+*.pyc
+.idea/
+.venv/
+*.log
+frontend/node_modules/
+frontend/dist/

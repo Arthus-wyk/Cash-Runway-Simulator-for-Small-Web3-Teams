@@ -1,0 +1,19 @@
+{
+  "captured_at": "2026-09-20T14:04:00.507312+00:00",
+  "request": {
+    "method": "GET",
+    "url": "https://pro-api.coinmarketcap.com/v2/cryptocurrency/ohlcv/historical?id=1&time_start=2026-09-16&time_end=2026-09-18&time_period=daily&convert=USD",
+    "authentication": "X-CMC_PRO_API_KEY: [REDACTED]"
+  },
+  "http_status": 403,
+  "response": {
+    "status": {
+      "timestamp": "2026-09-20T14:04:00.399Z",
+      "error_code": 1006,
+      "error_message": "Your API Key subscription plan doesn't support this endpoint.",
+      "elapsed": 1,
+      "credit_count": 0,
+      "notice": null
+    }
+  }
+}
